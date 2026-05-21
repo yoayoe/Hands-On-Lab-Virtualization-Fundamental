@@ -180,6 +180,9 @@ ip addr show
 # atau
 hostname -I
 
+# Install network Utils
+sudo apt update && sudo apt install iputils-ping -y
+
 # Cek koneksi internet
 ping -c 4 google.com
 ```
