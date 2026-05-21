@@ -432,6 +432,90 @@ cat /proc/meminfo | head -5
 
 > Memperkecil disk **tidak didukung** oleh VirtualBox. Hanya bisa diperbesar.
 
+---
+
+### ⚠️ Wajib Dilakukan Pertama: Hapus Snapshot Sebelum Resize
+
+**Jika VM memiliki snapshot aktif, resize disk kemungkinan besar tidak akan bekerja — VirtualBox menampilkan ukuran baru, tapi OS di dalam VM tetap melihat ukuran lama.**
+
+#### Mengapa Snapshot Menghalangi Resize?
+
+Saat VM memiliki snapshot, VirtualBox tidak lagi menulis langsung ke disk asli (base VDI). Sebagai gantinya, VirtualBox membuat **differencing disk** — file disk terpisah yang hanya menyimpan **selisih perubahan (delta)** dari kondisi saat snapshot diambil.
+
+```
+Base VDI (10 GB) ──── dibuat saat import VM
+        │
+        └── [Snapshot: "Fresh Import - Sebelum Konfigurasi"]
+                │
+                └── Differencing Disk (delta) ──── kondisi VM saat ini
+```
+
+Ketika Anda resize di VirtualBox:
+- `VBoxManage modifyhd --resize` **tidak bisa mengubah base VDI** selama masih ada differencing disk (child disk) yang bergantung padanya
+- Resize via GUI mungkin terlihat berhasil, tapi sebenarnya hanya memperbarui metadata pada differencing disk
+- OS di dalam VM membaca block device yang berakar dari **base VDI yang belum berubah**
+- Hasilnya: VirtualBox menampilkan 12 GB, tetapi `lsblk` di dalam VM tetap menunjukkan 10 GB
+
+Anda bisa memverifikasi kondisi ini dari **Settings → Storage → pilih disk**. Jika kolom **Storage details** tertulis:
+
+```
+Dynamically allocated differencing storage   ← ada snapshot aktif, resize akan gagal
+Dynamically allocated storage                ← tidak ada snapshot, aman untuk resize
+```
+
+---
+
+#### Langkah: Hapus Snapshot Sebelum Resize
+
+> ⚠️ VM harus dalam kondisi **Powered Off** sebelum menghapus snapshot.
+
+**Via GUI:**
+
+1. Pastikan VM **Powered Off**
+2. Pilih VM di sidebar → klik ikon **Snapshots** (tab di kanan atas panel VM)
+3. Klik kanan snapshot yang ada → **Delete Snapshot**
+
+   ```
+   ┌──────────────────────────────────────────────────────────┐
+   │  Snapshots                                               │
+   │                                                          │
+   │  📷 Fresh Import - Sebelum Konfigurasi   ← klik kanan   │
+   │       └── [Current State]                               │
+   │                                                          │
+   │  [ Take ]  [ Restore ]  [ Delete ]                      │
+   └──────────────────────────────────────────────────────────┘
+   ```
+
+4. Konfirmasi penghapusan → VirtualBox akan melakukan **merge** (menggabungkan differencing disk ke base VDI)
+5. **Tunggu hingga proses merge selesai** — bisa 2–10 menit tergantung ukuran disk. Jangan tutup VirtualBox selama proses ini
+6. Setelah selesai, cek kembali **Storage details** — harus sudah berubah menjadi **"Dynamically allocated storage"** (tanpa kata "differencing")
+7. Baru lanjutkan ke langkah 5.1 untuk resize
+
+**Via CLI:**
+
+```bash
+# Lihat semua snapshot yang ada
+VBoxManage snapshot "NamaVM" list
+
+# Output contoh:
+#   Name: Fresh Import - Sebelum Konfigurasi (UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+#      Name: Current State (UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+
+# Hapus snapshot berdasarkan nama
+VBoxManage snapshot "NamaVM" delete "Fresh Import - Sebelum Konfigurasi"
+
+# Verifikasi — setelah selesai, cek storage details
+VBoxManage showmediuminfo "path/ke/disk.vdi" | grep "Storage format"
+# Hasilnya tidak lagi menampilkan "differencing"
+```
+
+> **Apakah data VM hilang saat snapshot dihapus?**  
+> **Tidak.** Menghapus snapshot hanya menggabungkan (merge) perubahan dari differencing disk ke base VDI. Semua data dan kondisi VM saat ini tetap utuh. Yang hilang hanya kemampuan untuk kembali ke kondisi snapshot tersebut.
+
+> **Jika memiliki beberapa snapshot bercabang:** Hapus dari snapshot paling baru (paling bawah pohon) menuju ke yang paling lama. Menghapus snapshot tengah akan menyebabkan merge yang lebih kompleks dan memakan waktu lebih lama.
+
+---
+
 ### 5.1 Perbesar VDI/VMDK dari VirtualBox Manager
 
 1. Pastikan VM **Powered Off**
@@ -462,7 +546,54 @@ VBoxManage modifyhd "C:\VMs\ubuntu-lab\ubuntu-lab.vdi" --resize 30720
 VBoxManage modifyhd /home/user/VirtualBox\ VMs/ubuntu-lab/ubuntu-lab.vdi --resize 30720
 ```
 
-### 5.3 Extend Partisi di Dalam VM (LVM)
+### 5.3 Buat Snapshot Sebelum Extend LVM (Checkpoint Keamanan)
+
+Setelah resize disk di VirtualBox selesai, VM masih dalam kondisi **Powered Off** dan LVM belum disentuh sama sekali. Ini adalah momen terbaik untuk membuat snapshot.
+
+#### Mengapa Snapshot di Titik Ini?
+
+Proses extend LVM di Bagian 5.4 melibatkan beberapa perintah berurutan (`growpart` → `pvresize` → `lvextend` → `resize2fs`). Jika salah satu perintah dieksekusi dengan parameter yang keliru — misalnya nomor partisi salah pada `growpart`, atau nama LV yang tidak tepat pada `lvextend` — bisa menyebabkan partisi tidak terbaca atau filesystem rusak.
+
+Dengan snapshot di titik ini, Anda punya jaring pengaman: jika terjadi kesalahan di tengah proses extend, cukup **restore snapshot ini** dan mulai ulang dari kondisi bersih (disk sudah 12 GB, LVM belum dimodifikasi).
+
+```
+[Disk di-resize ke 12 GB] ──── snapshot di sini ────► [Extend LVM di dalam VM]
+        ↑                                                        ↓
+        └────────────── revert ke sini jika ada error ──────────┘
+```
+
+> Snapshot diambil saat VM **Powered Off** karena: tidak ada memory state yang perlu disimpan, proses lebih cepat, dan ukuran file snapshot lebih kecil dibanding snapshot saat VM berjalan.
+
+**Via GUI:**
+
+1. Pastikan VM masih **Powered Off**
+2. Buka tab **Snapshots** di VirtualBox
+3. Klik tombol **Take**
+4. Isi nama:
+
+   ```
+   Snapshot Name:  02 - Disk Resized - Pre LVM Extend
+   Description:    Disk sudah diperbesar ke [X] GB di VirtualBox.
+                   LVM belum dimodifikasi. Revert ke sini jika extend gagal.
+   ```
+
+5. Klik **OK** → snapshot dibuat dalam hitungan detik
+
+**Via CLI:**
+
+```bash
+VBoxManage snapshot "NamaVM" take "02 - Disk Resized - Pre LVM Extend" \
+  --description "Disk diperbesar di VirtualBox, LVM belum disentuh. Safety checkpoint."
+
+# Verifikasi
+VBoxManage snapshot "NamaVM" list
+```
+
+Setelah snapshot dibuat, nyalakan VM dan lanjutkan ke Bagian 5.4.
+
+---
+
+### 5.4 Extend Partisi di Dalam VM (LVM)
 
 Ubuntu 22.04 yang diinstal dengan opsi default menggunakan **LVM (Logical Volume Manager)**. Setelah disk diperbesar di VirtualBox, ada 4 tahap yang harus dilakukan di dalam VM:
 
@@ -525,6 +656,53 @@ df -h
 ```
 
 > **Catatan nama LV:** Jika nama VG/LV berbeda dari `ubuntu-vg/ubuntu-lv`, cek dengan `sudo lvdisplay` dan sesuaikan perintah `lvextend` dan `resize2fs`.
+
+---
+
+### 5.5 Buat Snapshot Baru Setelah Extend Berhasil
+
+Di Bagian 5.3 kita sudah membuat snapshot "Pre LVM Extend" sebagai jaring pengaman. Sekarang setelah extend berhasil dan `df -h` menunjukkan ukuran yang benar, **hapus snapshot lama itu dan ganti dengan snapshot baru** yang mencerminkan kondisi VM yang sudah selesai dikonfigurasi.
+
+Segera setelah `df -h` menunjukkan ukuran disk yang benar, **matikan VM dan buat snapshot baru** sebagai checkpoint.
+
+#### Mengapa Harus Setelah VM Mati?
+
+Snapshot yang diambil saat VM **mati (Powered Off)** tidak menyimpan memory state — proses ini lebih cepat, ukuran file snapshot lebih kecil, dan tidak ada risiko data yang sedang ditulis ke disk tertangkap dalam kondisi tidak konsisten. Untuk checkpoint pasca-konfigurasi hardware seperti ini, snapshot dari kondisi mati adalah pilihan yang lebih baik.
+
+```bash
+# ── Di dalam VM: shutdown dengan benar ───────────────────────
+sudo shutdown -h now
+```
+
+Setelah VM mati, buat snapshot dari host:
+
+**Via GUI:**
+
+1. Pastikan VM sudah **Powered Off** (status di sidebar VirtualBox: *Powered Off*)
+2. Buka tab **Snapshots**
+3. Klik tombol **Take** (ikon kamera)
+4. Isi nama yang deskriptif:
+
+   ```
+   Snapshot Name:  03 - Post Disk Extend - [ukuran GB]
+   Description:    Disk diperbesar dan LVM berhasil di-extend.
+                   Snapshot 02 (Pre LVM) bisa dihapus.
+   ```
+
+5. Klik **OK**
+
+**Via CLI (dari terminal host):**
+
+```bash
+# Buat snapshot saat VM dalam kondisi Powered Off
+VBoxManage snapshot "NamaVM" take "03 - Post Disk Extend" \
+  --description "Disk diperbesar dan LVM berhasil di-extend. Snapshot 02 bisa dihapus."
+
+# Verifikasi snapshot berhasil dibuat
+VBoxManage snapshot "NamaVM" list
+```
+
+> **Setelah snapshot 03 dibuat, snapshot 02 ("Pre LVM Extend") sudah tidak diperlukan** — tujuannya hanya sebagai jaring pengaman selama proses extend, dan extend sudah berhasil. Hapus snapshot 02 untuk menjaga pohon snapshot tetap rapi dan tidak membebani performa disk.
 
 ---
 
@@ -780,10 +958,11 @@ VBoxManage export "NamaVM" \
 | Masalah | Solusi |
 |---|---|
 | Slider vCPU/RAM tidak bisa digeser | Pastikan VM dalam kondisi Powered Off |
-| Error saat modifyhd resize | Pastikan VM off dan tidak ada snapshot aktif yang di-lock |
+| Error saat modifyhd resize | Pastikan VM off; jika ada snapshot, hapus dulu — VirtualBox tidak bisa resize base VDI selama masih ada differencing disk |
+| Resize berhasil di VirtualBox tapi `lsblk` masih ukuran lama | VM masih punya snapshot aktif saat resize dilakukan — hapus snapshot, resize ulang, lalu extend partisi |
 | Restore snapshot memakan waktu lama | Normal jika ada banyak perubahan disk; tunggu hingga selesai |
 | Snapshot tidak muncul di daftar | Refresh panel dengan klik VM lain lalu klik kembali |
-| Disk di VM tidak bertambah setelah resize | Perlu extend partisi di dalam VM (lihat Bagian 5.3) |
+| Disk di VM tidak bertambah setelah resize | Ada dua kemungkinan: (1) masih ada snapshot saat resize — lihat catatan di Bagian 5; (2) perlu extend partisi LVM di dalam VM — lihat Bagian 5.3 |
 | VBoxManage: VM not found | Pastikan nama VM persis sama (case-sensitive di Linux/macOS) |
 | `sudo netplan apply` error "invalid YAML" | Cek indentasi — gunakan spasi bukan tab; jalankan `cat -A file.yaml` untuk lihat karakter tersembunyi |
 | Interface tidak dapat IP setelah apply | Pastikan nama interface benar: jalankan `ip link show` dan sesuaikan nama di YAML |
